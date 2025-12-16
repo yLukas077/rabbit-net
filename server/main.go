@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -83,6 +85,25 @@ func main() {
 	// Armazenamento interno dos votos.
 	votos := map[string]string{}
 	contagem := map[string]int{"A": 0, "B": 0, "C": 0}
+
+	// Captura de CTRL+C para encerrar o programa de uma forma limpa
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan // Espera o sinal
+		log.Println("\nRecebido sinal de encerramento (CTRL+C).")
+		log.Println("Avisando clientes e desligando...")
+
+		// Envia mensagem de shutdown para todos os clientes
+		enviarShutdown(ch)
+
+		// Pequena pausa para garantir que a mensagem saiu
+		time.Sleep(500 * time.Millisecond)
+
+		conn.Close()
+		os.Exit(0)
+	}()
 
 	// Timer que encerra a votação automaticamente.
 	go func() {
@@ -214,6 +235,13 @@ func enviarParcial(ch *amqp.Channel, res map[string]int) {
 	publishJSON(ch, BroadcastMsg{
 		Tipo:   "parcial",
 		Result: res,
+	})
+}
+
+func enviarShutdown(ch *amqp.Channel) {
+	publishJSON(ch, BroadcastMsg{
+		Tipo:     "shutdown",
+		Mensagem: "O servidor foi desligado. Cliente encerrando...",
 	})
 }
 
