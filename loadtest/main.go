@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -19,12 +20,31 @@ type Voto struct {
 
 func main() {
 	// Quantidade de clientes simultâneos simulados.
-	const totalClients = 500
+	const totalClients = 20000
+
+	// Limite seguro de canais por conexão (RabbitMQ padrão aceita 2047, ocupando o 0 para controle interno, então sobram 2026 canais, o que foi testado e comprovado, logo vamos usar 1000 para segurança)
+	const clientsPerConnection = 1000
 
 	start := time.Now()
 	var wg sync.WaitGroup
 
 	fmt.Printf("Iniciando teste de carga com %d clientes simultâneos.\n", totalClients)
+
+	// 1. Calcula quantas conexões TCP reais precisamos abrir
+	numConnections := int(math.Ceil(float64(totalClients) / float64(clientsPerConnection)))
+	conns := make([]*amqp.Connection, numConnections)
+
+	fmt.Printf("Abrindo %d conexões TCP para distribuir a carga...\n", numConnections)
+
+	// 2. Abre o Pool de Conexões
+	for i := 0; i < numConnections; i++ {
+		c, err := amqp.Dial("amqp://admin:admin@localhost:5672/")
+		if err != nil {
+			log.Fatalf("Falha ao abrir conexão %d: %v", i, err)
+		}
+		conns[i] = c
+		defer c.Close()
+	}
 
 	for i := 1; i <= totalClients; i++ {
 		wg.Add(1)
@@ -32,18 +52,15 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 
-			// Cada cliente estabelece sua própria conexão com o RabbitMQ.
-			conn, err := amqp.Dial("amqp://admin:admin@localhost:5672/")
-			if err != nil {
-				log.Printf("Falha ao conectar (cliente %d): %v\n", id, err)
-				return
-			}
-			defer conn.Close()
+			// 3. Round-Robin ( que é um algoritmo padrão para distribuir carga ): Distribui o cliente para uma das conexões abertas
+			connIndex := id % numConnections
+			selectedConn := conns[connIndex]
 
-			// Cada cliente cria seu próprio canal.
-			ch, err := conn.Channel()
+			// Cria o canal leve dentro da conexão selecionada
+			ch, err := selectedConn.Channel()
 			if err != nil {
-				log.Printf("Falha ao abrir canal (cliente %d): %v\n", id, err)
+				// Se falhar aqui, é provável que atingiu o limite daquela conexão específica
+				log.Printf("Erro crítico ao criar canal (cliente %d na conn %d): %v", id, connIndex, err)
 				return
 			}
 			defer ch.Close()
@@ -79,8 +96,10 @@ func main() {
 
 	// Aguarda todos os clientes terminarem.
 	wg.Wait()
-
-	// Calcula o tempo total gasto no teste.
 	duration := time.Since(start)
-	fmt.Printf("Teste concluído. %d votos enviados em %v.\n", totalClients, duration)
+
+	// Estatísticas finais
+	reqPerSec := float64(totalClients) / duration.Seconds()
+	fmt.Printf("Teste concluído.\n")
+	fmt.Printf("Total: %d votos\nTempo: %v\nPerformance: %.2f req/s\n", totalClients, duration, reqPerSec)
 }

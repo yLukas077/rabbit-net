@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -29,10 +30,16 @@ type BroadcastMsg struct {
 	Result   map[string]int `json:"resultado,omitempty"`
 }
 
+// Mutex para proteger o Canal AMQP (Publish não é thread-safe).
+var amqpMu sync.Mutex
+
+// Mutex para proteger os mapas de votos e contagem.
+var stateMu sync.Mutex
+
 func main() {
 
-	// Tempo limite da votação. Pode ser sobrescrito pela variável de ambiente.
-	timeout := 30 * time.Second
+	// Tempo limite da votação.
+	timeout := 180 * time.Second
 	if v := os.Getenv("VOTING_TIMEOUT"); v != "" {
 		if t, err := time.ParseDuration(v); err == nil {
 			timeout = t
@@ -63,12 +70,14 @@ func main() {
 	ch.QueueBind(q.Name, "voto", "votacao.votos", false, nil)
 
 	// Inicia consumo da fila de votos.
+	// OBS: Qos (Quality of Service) ajuda a distribuir melhor as mensagens entre workers
+	ch.Qos(50, 0, false)
 	msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
 	if err != nil {
 		log.Fatalf("Erro ao consumir fila de votos: %v", err)
 	}
 
-	log.Println("Servidor de votação iniciado.")
+	log.Println("Servidor de votação iniciado com Worker Pool.")
 	log.Printf("Tempo máximo de votação: %v\n", timeout)
 
 	// Armazenamento interno dos votos.
@@ -79,50 +88,94 @@ func main() {
 	go func() {
 		time.Sleep(timeout)
 		log.Println("Encerrando votação por timeout.")
-		enviarFinal(ch, contagem)
+
+		// Proteção ao ler o estado final
+		stateMu.Lock()
+		finalResult := copiaMapa(contagem)
+		stateMu.Unlock()
+
+		enviarFinal(ch, finalResult)
 		os.Exit(0)
 	}()
 
-	// Loop principal: processa cada voto recebido.
-	for msg := range msgs {
-		var v Voto
+	// Configuração do Worker Pool
+	const numWorkers = 20
+	var wg sync.WaitGroup
 
-		// Converte o JSON recebido.
-		if err := json.Unmarshal(msg.Body, &v); err != nil {
-			log.Printf("Erro ao interpretar voto: %v\n", err)
-			continue
-		}
+	log.Printf("Iniciando %d workers...", numWorkers)
 
-		log.Printf("Voto recebido: %s votou em %s\n", v.UserID, v.Option)
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
 
-		// Impede voto duplicado.
-		if _, exists := votos[v.UserID]; exists {
-			enviarErro(ch, v.UserID, "Você já votou.")
-			continue
-		}
+			// Loop principal do worker: processa mensagens concorrentemente
+			for msg := range msgs {
+				var v Voto
 
-		// Validação da opção.
-		if v.Option != "A" && v.Option != "B" && v.Option != "C" {
-			enviarErro(ch, v.UserID, "Opção inválida.")
-			continue
-		}
+				// Converte o JSON recebido.
+				if err := json.Unmarshal(msg.Body, &v); err != nil {
+					log.Printf("[Worker %d] Erro ao interpretar voto: %v\n", workerID, err)
+					continue
+				}
 
-		// Registrando voto.
-		votos[v.UserID] = v.Option
-		contagem[v.Option]++
+				// Acesso à memória compartilhada
+				stateMu.Lock()
 
-		enviarConfirmacao(ch, v.UserID)
-		enviarParcial(ch, contagem)
+				// Impede voto duplicado.
+				if _, exists := votos[v.UserID]; exists {
+					stateMu.Unlock() // Liberando a trava antes de enviar rede
+					enviarErro(ch, v.UserID, "Você já votou.")
+					continue
+				}
+
+				// Validação da opção.
+				if v.Option != "A" && v.Option != "B" && v.Option != "C" {
+					stateMu.Unlock()
+					enviarErro(ch, v.UserID, "Opção inválida.")
+					continue
+				}
+
+				// Registrando voto.
+				votos[v.UserID] = v.Option
+				contagem[v.Option]++
+
+				// Cria snapshot do resultado para enviar fora do Lock
+				resultadoAtual := copiaMapa(contagem)
+
+				stateMu.Unlock()
+
+				log.Printf("[Worker %d] Voto recebido: %s -> %s\n", workerID, v.UserID, v.Option)
+
+				enviarConfirmacao(ch, v.UserID)
+				enviarParcial(ch, resultadoAtual)
+			}
+		}(i)
 	}
+
+	// Aguarda os workers
+	wg.Wait()
 }
 
 //
-// Funções auxiliares responsáveis por envio de mensagens de broadcast.
+// Funções auxiliares
 //
 
+// Cria uma cópia segura do mapa para evitar Data Race durante JSON Marshal
+func copiaMapa(original map[string]int) map[string]int {
+	novo := make(map[string]int, len(original))
+	for k, v := range original {
+		novo[k] = v
+	}
+	return novo
+}
 
 // Função geral de envio de mensagens JSON para a exchange de broadcast.
 func publishJSON(ch *amqp.Channel, msg BroadcastMsg) {
+	// Proteção: O canal AMQP não é thread-safe para publish concorrente
+	amqpMu.Lock()
+	defer amqpMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 

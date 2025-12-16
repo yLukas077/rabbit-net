@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -32,8 +33,11 @@ func main() {
 
 	// Loop que garante que o usuário informe um ID válido.
 	var id string
+	// Estado local do cliente (thread-safe)
+	var jaVotou atomic.Bool
+
 	for {
-		fmt.Print("Digite seu ID único: ")
+		fmt.Print("Digite seu ID único ou seu Nome: ")
 		raw, _ := reader.ReadString('\n')
 		id = strings.TrimSpace(raw)
 
@@ -105,6 +109,7 @@ func main() {
 
 			case "confirmacao":
 				if msg.UserID == id {
+					jaVotou.Store(true)
 					fmt.Printf("\nConfirmação: %s\n", msg.Mensagem)
 				}
 
@@ -117,6 +122,11 @@ func main() {
 				fmt.Println("\nParcial da votação:")
 				for op, val := range msg.Result {
 					fmt.Printf("  %s: %d votos\n", op, val)
+				}
+
+				if !jaVotou.Load() {
+					fmt.Println("\nOpções de voto: A, B, C")
+					fmt.Print("Digite sua opção: ")
 				}
 
 			case "final":
